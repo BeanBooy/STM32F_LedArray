@@ -1,89 +1,76 @@
 #include "stm32f4xx.h"
 #include "_mcpr_stm32f407.h"
 #include <inttypes.h>
+#include <stdlib.h>
+#include "utils.h"
+#include "led.h"
+#include "lcd.h"
+#include "timer.h"
 
-#define MASK_D (1<<14 | 1<<15 | 1<<0 | 1<<1 | 1<<8 | 1<<9 | 1<<10)
-#define MASK_E (1<<7 | 1<<8 | 1<<9 | 1<<10 | 1<<11 | 1<<12 | 1<<13 | 1<<14 | 1<<15)
 
-
-void u_delay(const double sec)
-{
-	const uint32_t loopCycles = (uint32_t) (sec * 12900000);
-	for (uint32_t i = 0; i < loopCycles; i++) { }
+uint8_t getButtonState(void) {
+	return GPIOA->IDR & 1;
 }
 
-void LEDs_InitPorts(void)
-{
-	// enable clock on GPIOD and GPIOE
-	RCC->AHB1ENR |= 1<<3 | 1<<4;
-	// set PD5, PD7 and PD11 to output
-	GPIOD->MODER |=  1<<(5*2) | 1<<(7*2) | 1<<(11*2);
-	// set all the display data pins to output
-	GPIOD->MODER |= 1<<(14*2) | 1<<(15*2) | 1<<(0*2) | 1<<(1*2) | 1<<(8*2) | 1<<(9*2) | 1<<(10*2);
-	GPIOE->MODER |= 1<<(7*2) | 1<<(8*2) | 1<<(9*2) | 1<<(10*2) | 1<<(11*2) | 1<<(12*2) | 1<<(13*2) | 1<<(14*2) | 1<<(15*2);
-	// set PD5, PD7 and PD11 to high
-	GPIOD->ODR |=  1<<5 | 1<<7 | 1<<11;
-}
-
-void LCD_Output16BitWord(const uint16_t data)
-{
-	const uint16_t odr_d =
-		(data>>0 & 1)<<14 |
-		(data>>1 & 1)<<15 |
-		(data>>2 & 1)<<0 |
-		(data>>3 & 1)<<1 |
-		(data>>13 & 1)<<8 |
-		(data>>14 & 1)<<9 |
-		(data>>15 & 1)<<10;
-
-	const uint16_t odr_e =
-		(data>>4 & 1)<<7 |
-		(data>>5 & 1)<<8 |
-		(data>>6 & 1)<<9 |
-		(data>>7 & 1)<<10 |
-		(data>>8 & 1)<<11 |
-		(data>>9 & 1)<<12 |
-		(data>>10 & 1)<<13 |
-		(data>>11 & 1)<<14 |
-		(data>>12 & 1)<<15;
-
-	// mask the required bits
-	GPIOD->ODR = (GPIOD->ODR & ~MASK_D) | odr_d;
-	GPIOE->ODR = (GPIOE->ODR & ~MASK_E) | odr_e;
-}
-
-void LEDs_Write(const uint16_t data)
-{
-	//LCD_Output16BitWord(data);
-	GPIOD->ODR |=  1<<11;
-	GPIOD->ODR &=  ~(1<<7);
-	GPIOD->ODR &=  ~(1<<5);
-	LCD_Output16BitWord(data);
-	GPIOD->ODR |=  1<<5;
-	GPIOD->ODR |=  1<<7;
-	GPIOD->ODR &=  ~(1<<11);
-}
+uint16_t secSinceReset = 0;
+char time_str[6];  // "MM:SS" + null terminator
 
 int main(void)
 {
 	mcpr_SetSystemCoreClock();
-	LEDs_InitPorts();
+	LEDs_Init();
+	LCD_Init();
+	Timer_Init();
 
-	uint16_t data = 1;
-	uint16_t counter = 0;
+	uint32_t last50ms = 0;
+	uint32_t last500ms = 0;
+
+	const uint32_t lcdCol1 = hex_to_rgb565(0x36454F);
+	const uint32_t lcdCol2 = hex_to_rgb565(0x51BA8E);
+	const uint8_t lcdBoxX = 10;
+	const uint8_t lcdBoxY = 190;
+	const uint8_t lcdBoxW = 120;
+	const uint8_t lcdBoxH = 50;
+
+	LCD_ClearDisplay(lcdCol1);
+	LCD_WriteString(10, 10, lcdCol2, lcdCol1, "Hello my friend!");
+
+	LCD_DrawRectangle(lcdBoxX, lcdBoxY, lcdBoxW, lcdBoxH, lcdCol2);
+	LCD_DrawRectangle(lcdBoxX + 2, lcdBoxY + 2, lcdBoxW - 4, lcdBoxH - 4, lcdCol1);
+	LCD_WriteString(lcdBoxX + 10, lcdBoxY + 10, lcdCol2, lcdCol1, "ON since:");
+
+	// green LED
+	RCC->AHB1ENR |= 1<<3;
+	GPIOD->MODER |= 1<<(12*2);
+	GPIOD->ODR |= 1<<12;
+
+	// user btn
+	RCC->AHB1ENR |= 1;
 
 	while (1) {
-		counter++;
-		// invert bits after complete cycle
-		if (counter % 16 == 0 && counter != 0) data = ~data;
-		// get overflow bit
-		int const overflow = 1<<15 & data;
-		// push data by one
-		data = data<<1;
-		// insert overflow bit
-		data = data + (overflow > 0);
-		LEDs_Write(data);
-		u_delay(.05);
-	}
+		if ((ms_Ticks - last50ms) >= 50) {
+			last50ms = ms_Ticks;
 
+			if (getButtonState()) {
+				if ((ms_Ticks - last500ms) >= 500) {
+					last500ms = ms_Ticks;
+					GPIOD->ODR ^= 1<<12;
+				}
+				Timer_EnableBackLight(10);
+			}
+			else {
+				GPIOD->ODR &= ~(1<<12);
+			}
+
+			LEDs_NextTick();
+
+			// update counter on display
+			if (secSinceReset < ms_Ticks / 1000) {
+				secSinceReset = ms_Ticks / 1000;
+				format_time(secSinceReset, time_str);
+				LCD_WriteString(lcdBoxX + 10, lcdBoxY + 26, lcdCol2, lcdCol1, time_str);
+			}
+
+		}
+	}
 }
